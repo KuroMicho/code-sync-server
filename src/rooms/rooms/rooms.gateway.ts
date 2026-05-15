@@ -10,147 +10,160 @@ import {
 import { Server, Socket } from 'socket.io';
 
 @WebSocketGateway({
-  cors: {
-    origin: '*', // En producción, especificar el dominio
-  },
+  cors: { origin: '*' },
   namespace: 'code-sync',
-  // Aumentamos a 30MB para soportar el envío masivo de archivos del desafío final
-  maxHttpBufferSize: 3e7,
+  maxHttpBufferSize: 3e7, // 30MB para proyectos masivos
 })
 export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server!: Server;
 
+  // NUEVO: Mapa para guardar el fin del timer por sala { roomId: endTime }
+  private activeTimers = new Map<
+    string,
+    { duration: number; endTime: number }
+  >();
+
   handleConnection(client: Socket) {
-    console.log(`[SISTEMA]: Conexión establecida -> ${client.id}`);
+    console.log(`[CONEXIÓN]: ID ${client.id} establecida.`);
   }
 
   handleDisconnect(client: Socket) {
-    console.log(`[SISTEMA]: Conexión cerrada -> ${client.id}`);
-    // Notificamos globalmente para que los docentes limpien sus listas
-    this.server.emit('user-disconnected', client.id);
+    const { name, roomId, role } = client.data;
+    if (roomId) {
+      console.log(
+        `[DESCONEXIÓN]: ${role?.toUpperCase()} ${name} salió de ${roomId}.`,
+      );
+      this.server.to(`${roomId}-teachers`).emit('user-disconnected', client.id);
+    }
   }
 
-  /**
-   * Une a un usuario a una sala, limpiando cualquier suscripción previa.
-   */
   @SubscribeMessage('join-room')
   handleJoinRoom(
     @ConnectedSocket() client: Socket,
     @MessageBody()
     data: { roomId: string; role: 'teacher' | 'student'; name: string },
   ) {
-    // 1. LIMPIEZA DE SALAS PREVIAS (Evita "agentes dobles")
+    // 1. LIMPIEZA ATÓMICA
     const currentRooms = Array.from(client.rooms).filter(
       (r) => r !== client.id,
     );
+    currentRooms.forEach((r) => client.leave(r));
 
-    currentRooms.forEach((oldRoom) => {
-      // Avisar a los profes de la sala anterior que el usuario se va
-      this.server
-        .to(`${oldRoom}-teachers`)
-        .emit('user-disconnected', client.id);
-      client.leave(oldRoom);
-      client.leave(`${oldRoom}-teachers`);
-    });
+    // 2. ASIGNACIÓN DE IDENTIDAD INMUTABLE (Persiste en el socket)
+    client.data.role = data.role;
+    client.data.name = data.name;
+    client.data.roomId = data.roomId;
 
-    // 2. UNIR A NUEVA SALA
     client.join(data.roomId);
 
     if (data.role === 'teacher') {
       client.join(`${data.roomId}-teachers`);
-      // Pedir a los alumnos de la nueva sala que sincronicen sus archivos
-      client.to(data.roomId).emit('request-sync');
-      console.log(`[DOCENTE]: ${data.name} entró a sala ${data.roomId}`);
+      client.to(data.roomId).emit('request-sync'); // Forzar a alumnos a reportarse
+      console.log(
+        `[DOCENTE]: ${data.name} tomó control de la sala ${data.roomId}`,
+      );
     } else {
-      console.log(`[ESTUDIANTE]: ${data.name} entró a sala ${data.roomId}`);
+      console.log(
+        `[ESTUDIANTE]: ${data.name} se unió a la sala ${data.roomId}`,
+      );
     }
 
-    // 3. NOTIFICAR AL EQUIPO DOCENTE DE LA SALA
+    // Notificar solo a los profes de esta sala específica
     this.server.to(`${data.roomId}-teachers`).emit('user-joined', {
       id: client.id,
       name: data.name,
       role: data.role,
     });
 
-    return { status: 'ok' };
+    // 🛡️ RECONEXIÓN DE TIMER:
+    // Si el usuario entra y hay un timer activo en esa sala...
+    const roomTimer = this.activeTimers.get(data.roomId);
+    if (roomTimer) {
+      const remainingMs = roomTimer.endTime - Date.now();
+      if (remainingMs > 0) {
+        // Le enviamos al alumno que se acaba de conectar el tiempo exacto que queda
+        const remainingMinutes = remainingMs / 60000;
+        client.emit('timer-started', {
+          minutes: remainingMinutes,
+          isSync: true, // Flag para saber que es una sincronización
+        });
+      }
+    }
+
+    return { status: 'ok', session: client.data };
   }
 
   /**
-   * Reenvía el árbol de archivos del alumno al canal de docentes.
+   * ACCIONES EXCLUSIVAS DE ESTUDIANTE
    */
+
   @SubscribeMessage('refresh-file-tree')
   handleRefreshTree(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { roomId: string; files: string[]; name: string },
+    @MessageBody() data: any,
   ) {
-    this.server.to(`${data.roomId}-teachers`).emit('student-file-tree', {
+    // Seguridad: Un profesor no debe enviar su árbol
+    if (client.data.role !== 'student') return;
+
+    this.server.to(`${client.data.roomId}-teachers`).emit('student-file-tree', {
       studentId: client.id,
-      name: data.name,
+      name: client.data.name,
       files: data.files,
     });
   }
 
-  /**
-   * Sincronización en vivo (mientras el alumno escribe).
-   */
   @SubscribeMessage('code-update')
   handleCodeUpdate(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { roomId: string; filePath: string; content: string },
+    @MessageBody() data: any,
   ) {
-    this.server.to(`${data.roomId}-teachers`).emit('code-remote-update', {
-      studentId: client.id,
-      filePath: data.filePath,
-      content: data.content,
-    });
+    if (client.data.role !== 'student') return;
+
+    this.server
+      .to(`${client.data.roomId}-teachers`)
+      .emit('code-remote-update', {
+        studentId: client.id,
+        filePath: data.filePath,
+        content: data.content,
+      });
   }
 
-  /**
-   * Petición P2P de contenido (Docente -> Estudiante)
-   */
-  @SubscribeMessage('request-file-content')
-  handleRequestFile(
+  @SubscribeMessage('student-submit-task')
+  handleStudentSubmit(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { studentId: string; filePath: string },
+    @MessageBody() data: any,
   ) {
-    this.server.to(data.studentId).emit('get-content', {
-      teacherId: client.id,
-      filePath: data.filePath,
-    });
+    // Validación de Identidad y Rol
+    if (client.data.role !== 'student') {
+      console.warn(
+        `[⚠️ ALERTA]: Intento de envío ilegal de Snapshot por ${client.data.name}`,
+      );
+      return { status: 'denied' };
+    }
+
+    this.server
+      .to(`${client.data.roomId}-teachers`)
+      .emit('final-submission-received', {
+        studentId: client.id,
+        name: client.data.name,
+        files: data.files,
+      });
+    console.log(`[ENTREGA]: Snapshot recibido de ${client.data.name}`);
   }
 
   /**
-   * Respuesta P2P de contenido (Estudiante -> Docente)
+   * ACCIONES EXCLUSIVAS DE DOCENTE
    */
-  @SubscribeMessage('send-content')
-  handleSendContent(
-    @ConnectedSocket() client: Socket,
-    @MessageBody()
-    data: { teacherId: string; filePath: string; content: string },
-  ) {
-    this.server.to(data.teacherId).emit('file-content-received', {
-      studentId: client.id,
-      filePath: data.filePath,
-      content: data.content,
-    });
-  }
 
-  /**
-   * El profesor crea archivos en los clientes de los alumnos (individual o broadcast).
-   */
   @SubscribeMessage('teacher-create-file')
   handleCreateFile(
     @ConnectedSocket() client: Socket,
-    @MessageBody()
-    data: {
-      roomId: string;
-      studentId?: string;
-      fileName: string;
-      initialContent: string;
-      isBinary: boolean;
-    },
+    @MessageBody() data: any,
   ) {
+    // Bloqueo: Si no es profe, no puede distribuir archivos
+    if (client.data.role !== 'teacher') return { status: 'forbidden' };
+
     const payload = {
       fileName: data.fileName,
       initialContent: data.initialContent,
@@ -160,53 +173,128 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (data.studentId) {
       this.server.to(data.studentId).emit('create-local-file', payload);
     } else {
-      client.to(data.roomId).emit('create-local-file', payload);
+      // Usamos client.data.roomId para asegurar que no envíe a otras salas
+      client.to(client.data.roomId).emit('create-local-file', payload);
     }
   }
 
-  /**
-   * LÓGICA DE DESAFÍO: Iniciar cronómetro.
-   */
   @SubscribeMessage('start-timer')
-  handleStartTimer(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { roomId: string; minutes: number },
-  ) {
+  handleStartTimer(client: Socket, data: { roomId: string; minutes: number }) {
+    if (client.data.role !== 'teacher') return;
+
+    const endTime = Date.now() + data.minutes * 60000;
+
+    // Guardamos en la memoria del servidor
+    this.activeTimers.set(data.roomId, {
+      duration: data.minutes,
+      endTime: endTime,
+    });
+
     this.server.to(data.roomId).emit('timer-started', {
       minutes: data.minutes,
       startTime: Date.now(),
     });
   }
 
-  /**
-   * LÓGICA DE DESAFÍO: Cancelar cronómetro.
-   */
   @SubscribeMessage('stop-timer')
-  handleStopTimer(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { roomId: string },
-  ) {
-    this.server.to(data.roomId).emit('timer-stopped');
+  handleStopTimer(client: Socket) {
+    if (client.data.role !== 'teacher') return;
+
+    // Limpiamos el timer del servidor
+    this.activeTimers.delete(client.data.roomId);
+    this.server.to(client.data.roomId).emit('timer-stopped');
   }
 
   /**
-   * ENTREGA FINAL: Recibe el proyecto completo del alumno (Snapshot).
+   * COMUNICACIÓN P2P (PROFE <-> ALUMNO)
    */
-  @SubscribeMessage('student-submit-task')
-  handleStudentSubmit(
+
+  @SubscribeMessage('request-file-content')
+  handleRequestFile(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { roomId: string; name: string; files: any[] },
+    @MessageBody() data: { studentId: string; filePath: string },
   ) {
-    // Reenviamos todo el paquete a los profesores de la sala
+    if (client.data.role !== 'teacher') return;
     this.server
-      .to(`${data.roomId}-teachers`)
-      .emit('final-submission-received', {
+      .to(data.studentId)
+      .emit('get-content', { teacherId: client.id, filePath: data.filePath });
+  }
+
+  @SubscribeMessage('send-content')
+  handleSendContent(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: any,
+  ) {
+    // El alumno le responde al profe que solicitó
+    this.server.to(data.teacherId).emit('file-content-received', {
+      studentId: client.id,
+      filePath: data.filePath,
+      content: data.content,
+    });
+  }
+
+  @SubscribeMessage('request-help')
+  handleRequestHelp(@ConnectedSocket() client: Socket) {
+    // Solo los alumnos piden ayuda
+    if (client.data.role !== 'student') return;
+
+    this.server
+      .to(`${client.data.roomId}-teachers`)
+      .emit('student-help-requested', {
         studentId: client.id,
-        name: data.name,
-        files: data.files, // Array de { path, content } en Base64
       });
-    console.log(
-      `[ENTREGA]: Proyecto recibido de ${data.name} (${data.files.length} archivos)`,
-    );
+    console.log(`[AYUDA]: ${client.data.name} ha solicitado asistencia.`);
+  }
+
+  @SubscribeMessage('resolve-help')
+  handleResolveHelp(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { studentId: string },
+  ) {
+    // Solo el profe puede marcar como resuelta
+    if (client.data.role !== 'teacher') return;
+
+    this.server
+      .to(`${client.data.roomId}-teachers`)
+      .emit('student-help-resolved', {
+        studentId: data.studentId,
+      });
+  }
+
+  @SubscribeMessage('send-chat-message')
+  handleChatMessage(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { message: string; targetId?: string },
+  ) {
+    const { roomId, name, role } = client.data;
+    if (!roomId) return;
+
+    const payload = {
+      sender: name,
+      role: role,
+      message: data.message,
+      timestamp: new Date().toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      }),
+    };
+
+    if (role === 'teacher') {
+      if (data.targetId) {
+        // Mensaje privado del profesor a un alumno específico
+        this.server.to(data.targetId).emit('chat-message-received', payload);
+      } else {
+        // Comunicado general del profesor a toda la sala
+        client.to(roomId).emit('chat-message-received', payload);
+      }
+    } else {
+      // El alumno envía un mensaje; solo le llega a los profesores de la sala
+      this.server
+        .to(`${roomId}-teachers`)
+        .emit('chat-message-received', payload);
+    }
+
+    console.log(`[CHAT] [${roomId}] ${name} (${role}): ${data.message}`);
   }
 }
