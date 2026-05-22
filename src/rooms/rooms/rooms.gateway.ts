@@ -7,78 +7,184 @@ import {
   WebSocketGateway,
   WebSocketServer,
 } from '@nestjs/websockets';
-import { Server, Socket } from 'socket.io';
+import { Server } from 'socket.io';
+import { RoomsService } from './rooms.service';
+import type { CustomSocket, JoinRoomPayload, ChatMessagePayload } from './rooms.types';
 
 @WebSocketGateway({
   cors: { origin: '*' },
   namespace: 'code-sync',
-  maxHttpBufferSize: 3e7, // 30MB para transferencias masivas de snapshots base64
-  pingInterval: 10000, // Latido constante cada 10 segundos
-  pingTimeout: 20000, // Margen de espera de 20s para mitigar microcortes de Wi-Fi
+  maxHttpBufferSize: 3e7, // 30MB para transferir snapshots y buffers binarios masivos sin desbordamientos
+  pingInterval: 10000,
+  pingTimeout: 20000,
 })
 export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server!: Server;
 
-  // Mapa global para persistir el ciclo de vida de los cronómetros { roomId: { duration, endTime } }
-  private activeTimers = new Map<
-    string,
-    { duration: number; endTime: number }
-  >();
+  constructor(private readonly roomsService: RoomsService) {}
 
   /**
-   * Captura la conexión inicial del canal de WebSockets
+   * Registra el enlace de hardware inicial de un cliente en los logs del clúster.
    */
-  handleConnection(client: Socket) {
-    console.log(
-      `[CONEXIÓN ESTABLECIDA]: ID único asignado de forma remota: ${client.id}`,
-    );
+  handleConnection(@ConnectedSocket() client: CustomSocket) {
+    this.roomsService.log('CONEXIÓN', `Canal de red establecido con éxito para el ID: ${client.id}`);
   }
 
   /**
-   * Captura la desconexión del socket limpiando recursos y notificando a los paneles docentes
+   * Gestiona el ciclo de vida de desconexión.
+   * Si es un nodo web o de edición, notifica inmediatamente a las mesas de control docentes.
    */
-  handleDisconnect(client: Socket) {
+  handleDisconnect(@ConnectedSocket() client: CustomSocket) {
     const { name, roomId, role } = client.data;
+
     if (roomId) {
-      console.log(
-        `[DESCONEXIÓN DE RED]: ${role?.toUpperCase()} | Nombre: ${name || 'Desconocido'} abandonó de forma física la sala: ${roomId}`,
+      this.roomsService.log(
+        'DESCONEXIÓN',
+        `${role?.toUpperCase()} | Alumno: ${name || 'Desconocido'} abandonó la sala.`,
       );
-      // Notifica de forma inmediata a los dashboards y árboles laterales para purgar al alumno
-      this.server.to(`${roomId}-teachers`).emit('user-disconnected', client.id);
+
+      this.server.to(`${roomId}-teachers`).emit('user-disconnected', {
+        socketId: client.id,
+        studentName: name,
+        role: role,
+      });
+
+      // 🛡️ PURGA AUTOMÁTICA CRUZADA: Si el estudiante cierra su VS Code, clausura su webapp asociada
+      if (role === 'student' && name) {
+        this.server
+          .in(roomId)
+          .fetchSockets()
+          .then((sockets) => {
+            const webClientAsociado = sockets.find(
+              (s: any) =>
+                s.data.role === 'student-web' && s.data.name.trim().toLowerCase() === name.trim().toLowerCase(),
+            );
+
+            if (webClientAsociado) {
+              this.roomsService.log(
+                'PURGA_AUTOMÁTICA',
+                `Cerrando canal CodeSync Web para ${name} por abandono de VS Code.`,
+              );
+              this.server.to(webClientAsociado.id).emit('force-close-web');
+            }
+          });
+      }
     }
   }
 
   /**
-   * Autenticación, asignación de roles estratégicos y sincronización atómica de estados residuales
+   * Orquestador central de ingreso y asignación contextual de privilegios por Rol.
    */
   @SubscribeMessage('join-room')
-  async handleJoinRoom(
-    @ConnectedSocket() client: Socket,
-    @MessageBody()
-    data: { roomId: string; role: 'teacher' | 'student'; name: string },
-  ) {
-    console.log(
-      `[SOLICITUD ACCESO]: Intento de ingreso de ${data.name} como [${data.role.toUpperCase()}] a la Sala: ${data.roomId}`,
-    );
+  async handleJoinRoom(@ConnectedSocket() client: CustomSocket, @MessageBody() data: JoinRoomPayload) {
+    // -----------------------------------------------------------------
+    // 🛡️ SUB-ESTACIÓN 1: VALIDACIONES FILTRADAS DE SEGURIDAD
+    // -----------------------------------------------------------------
 
-    // 1. LIMPIEZA ATÓMICA DE PRE-CONEXIONES (Evita duplicados si cambian de sala sin cerrar VS Code)
-    const currentRooms = Array.from(client.rooms).filter(
-      (r) => r !== client.id,
-    );
-    currentRooms.forEach((r) => {
-      client.leave(r);
-      console.log(
-        `[PURGA LOCAL]: ID: ${client.id} removido de sala residual: ${r}`,
+    if (data.role === 'teacher') {
+      const masterKey = process.env.CODESYNC_TEACHER_KEY;
+      if (!data.accessKey || data.accessKey !== masterKey) {
+        this.roomsService.log(
+          'ALERTA_SEGURIDAD',
+          `🚨 INTRUSIÓN DETECTADA: Intento de usurpación docente en Sala: ${data.roomId} desde IP: ${client.handshake.address}`,
+          true,
+        );
+        client.emit('join-rejected', 'La clave de acceso docente proporcionada es incorrecta.');
+        client.disconnect();
+        return;
+      }
+      this.roomsService.log('DOCENTE_AUTENTICADO', `Profesor '${data.name}' autenticado de forma segura.`);
+    }
+
+    if (data.role === 'student-web') {
+      const roomSockets = await this.server.in(data.roomId).fetchSockets();
+      const webNameClean = data.name.trim().toLowerCase();
+
+      // Buscamos la sesion origen de VS Code del alumno
+      const vscodeSocketTarget = roomSockets.find(
+        (s: any) => s.data.role === 'student' && s.data.name.trim().toLowerCase() === webNameClean,
       );
-    });
 
-    // 2. ASIGNACIÓN DE IDENTIDAD EN MEMORIA VOLÁTIL DEL SOCKET
+      if (!vscodeSocketTarget) {
+        this.roomsService.log(
+          'RECHAZO_WEB',
+          `Intento de suplantacion o alias invalido: '${data.name}' en Sala: ${data.roomId}`,
+          true,
+        );
+        client.emit(
+          'join-rejected',
+          'Tu nombre no coincide con ninguna sesion activa de VS Code. Inicia sesion en tu editor primero.',
+        );
+        return;
+      }
+
+      // 🚀 ANTÍDOTO AL CLON DE CARDS: Forzamos a que adopte exactamente la tipografia registrada en el editor
+      data.name = vscodeSocketTarget.data.name;
+    }
+
+    // -----------------------------------------------------------------
+    // ⚙️ SUB-ESTACIÓN 2: LIMPIEZA Y PERSISTENCIA COMÚN DE IDENTIDAD
+    // -----------------------------------------------------------------
+    // Purgamos sesiones huérfanas o duplicadas previas del mismo alumno en VS Code
+    if (data.role === 'student') {
+      const activeSockets = await this.server.in(data.roomId).fetchSockets();
+      const nuevoNombreClean = data.name.trim().toLowerCase();
+
+      const nombreAnterior = client.data.name;
+      if (nombreAnterior && nombreAnterior.trim().toLowerCase() !== nuevoNombreClean) {
+        this.roomsService.log(
+          'MUTACIÓN_IDENTIDAD',
+          `⚠️ Alumno con ID ${client.id} cambió su identidad de '${nombreAnterior}' a '${data.name}'`,
+          true,
+        );
+
+        const webVieja = activeSockets.find(
+          (s: any) =>
+            s.data.role === 'student-web' && s.data.name.trim().toLowerCase() === nombreAnterior.trim().toLowerCase(),
+        );
+
+        if (webVieja) {
+          this.roomsService.log(
+            'PURGA_MUTACIÓN',
+            `Clausurando CodeSync Web viejo de '${nombreAnterior}' por cambio de nombre.`,
+          );
+          this.server.to(webVieja.id).emit('force-close-web');
+          webVieja.leave(data.roomId);
+          webVieja.disconnect();
+        }
+
+        this.server.to(`${data.roomId}-teachers`).emit('user-disconnected', {
+          socketId: client.id,
+          studentName: nombreAnterior,
+          role: 'student',
+        });
+      }
+
+      const duplicateSocket = activeSockets.find(
+        (s: any) =>
+          s.id !== client.id && s.data.role === 'student' && s.data.name.trim().toLowerCase() === nuevoNombreClean,
+      );
+      if (duplicateSocket) {
+        duplicateSocket.leave(data.roomId);
+        duplicateSocket.disconnect();
+      }
+    }
+
+    this.roomsService.log(
+      'ACCESO',
+      `Cuenta '${data.name}' autorizada para rol [${data.role.toUpperCase()}] en Sala: ${data.roomId}`,
+    );
+
+    // Limpieza de buffers de salas previos en caliente para mitigar fugas de trafico
+    const currentRooms = Array.from(client.rooms).filter((r) => r !== client.id);
+    currentRooms.forEach((r) => client.leave(r));
+
+    // Mapeo de identidad en metadatos volatiles de socket
     client.data.role = data.role;
     client.data.name = data.name;
     client.data.roomId = data.roomId;
 
-    // Inicialización predeterminada de telemetría para alumnos nuevos
     if (data.role === 'student') {
       client.data.isFocused = true;
       client.data.wpm = 0;
@@ -89,90 +195,140 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     client.join(data.roomId);
 
-    // 3. LOGICA RECOLECTORA SEGÚN EL ROL
-    if (data.role === 'teacher') {
-      client.join(`${data.roomId}-teachers`);
-      client.to(data.roomId).emit('request-sync'); // Fuerza un escaneo inmediato de árboles de archivos en alumnos
-      console.log(
-        `[AUTORIZACIÓN DOCENTE]: Profesor '${data.name}' tomó control del ecosistema de la sala [${data.roomId}]`,
-      );
-
-      // 🧠 SINCRONIZACIÓN DE CACHE DE CLASE (Late-Joiner): Reconstruye el aula si el profe entra tarde o recarga
-      const roomSockets = await this.server.in(data.roomId).fetchSockets();
-      console.log(
-        `[RECONSTRUCCIÓN DE FLUJO]: Compilando telemetría de ${roomSockets.length} nodos activos para el docente.`,
-      );
-
-      roomSockets.forEach((s) => {
-        if (s.data.role === 'student') {
-          // Re-inyecta la existencia al árbol izquierdo del VS Code del profesor
-          client.emit('user-joined', {
-            id: s.id,
-            name: s.data.name,
-            role: 'student',
-          });
-
-          // Re-inyecta sus analíticas exactas acumuladas al Dashboard central
-          client.emit('telemetry-updated', {
-            studentId: s.id,
-            name: s.data.name,
-            isFocused: s.data.isFocused !== false,
-            wpm: s.data.wpm || 0,
-            isAskingHelp: s.data.isAskingHelp || false,
-            isCopyPaste: s.data.alertCopy || false,
-            activeFilePath: s.data.activeFilePath || '',
-          });
-        }
-      });
-    } else {
-      console.log(
-        `[MATRÍCULA ALUMNO]: Estudiante '${data.name}' reportado y listo para recibir instrucciones en la sala [${data.roomId}]`,
-      );
-    }
-
-    // Reportar incorporación al pool de docentes activos de esta sala
-    this.server.to(`${data.roomId}-teachers`).emit('user-joined', {
-      id: client.id,
-      name: data.name,
-      role: data.role,
-    });
-
-    // 🛡️ RECONEXIÓN CRONOMETRADA ANTI-CAÍDAS DE INTERNET
-    const roomTimer = this.activeTimers.get(data.roomId);
-    if (roomTimer) {
-      const remainingMs = roomTimer.endTime - Date.now();
-      if (remainingMs > 0) {
-        const remainingMinutes = remainingMs / 60000;
-        client.emit('timer-started', {
-          minutes: remainingMinutes,
-          isSync: true,
+    // -----------------------------------------------------------------
+    // 🗺️ SUB-ESTACIÓN 3: ENRUTAMIENTO DE LOGICA REACTIVA POR ROL
+    // -----------------------------------------------------------------
+    switch (data.role) {
+      case 'student-web': {
+        this.roomsService.log('VINCULACIÓN_WEB', `Canal multimedia web activado para: ${data.name}`);
+        client.emit('join-success');
+        this.server.to(`${data.roomId}-teachers`).emit('telemetry-updated', {
+          studentName: data.name,
+          screenLinked: true,
         });
-        console.log(
-          `[SALVAGUARDA CRONÓMETRO]: Sincronizando reloj de ${data.name} a ${remainingMinutes.toFixed(2)} minutos restantes.`,
-        );
+        break;
+      }
+
+      case 'teacher': {
+        client.join(`${data.roomId}-teachers`);
+        client.to(data.roomId).emit('request-sync');
+        client.emit('join-success', { role: 'teacher', name: data.name, roomId: data.roomId });
+
+        // Reconstrucción Late-Join asincrona para el Docente que entra tarde
+        const roomSockets = await this.server.in(data.roomId).fetchSockets();
+        roomSockets.forEach((s: any) => {
+          if (s.data.role === 'student') {
+            client.emit('user-joined', { id: s.id, name: s.data.name, role: 'student' });
+            client.emit('telemetry-updated', {
+              studentId: s.id,
+              name: s.data.name,
+              isFocused: s.data.isFocused !== false,
+              wpm: s.data.wpm || 0,
+              isAskingHelp: s.data.isAskingHelp || false,
+              isCopyPaste: s.data.alertCopy || false,
+              activeFilePath: s.data.activeFilePath || '',
+            });
+          }
+          if (s.data.role === 'student-web') {
+            client.emit('telemetry-updated', { studentName: s.data.name, screenLinked: true });
+          }
+        });
+        break;
+      }
+
+      case 'student': {
+        client.emit('join-success', { role: 'student', name: data.name, roomId: data.roomId });
+
+        // Sincronización proactiva de cronometros contra cortes de red
+        const remainingMs = this.roomsService.getRemainingMs(data.roomId);
+        if (remainingMs > 0) {
+          client.emit('timer-started', { minutes: remainingMs / 60000, isSync: true });
+        }
+
+        // Despacho directo a la sala comun para que el Docente intercepte al alumno al instante
+        this.server.to(data.roomId).emit('user-joined', {
+          id: client.id,
+          name: data.name,
+          role: data.role,
+        });
+        break;
       }
     }
 
     return { status: 'ok', session: client.data };
   }
 
-  /**
-   * ==========================================
-   * SECCIÓN: TELEMETRÍA Y ACCIONES DE ALUMNOS
-   * ==========================================
-   */
+  // =================================================================
+  // 📸 PIPELINE DE CAPTURAS DE MONITOR EN VIVO (MÓDULO BINARIO RAW)
+  // =================================================================
+
+  @SubscribeMessage('request-desktop-screenshot')
+  async handleRequestScreenshot(@ConnectedSocket() client: CustomSocket, @MessageBody() data: { studentName: string }) {
+    if (client.data.role !== 'teacher') return;
+
+    this.roomsService.log('TELEMETRÍA', `Solicitando captura de monitor en vivo para: ${data.studentName}`);
+
+    const sockets = await this.server.in(client.data.roomId!).fetchSockets();
+    const targetWebClient = sockets.find((s: any) => s.data.role === 'student-web' && s.data.name === data.studentName);
+
+    if (targetWebClient) {
+      this.server.to(targetWebClient.id).emit('trigger-screenshot', { teacherId: client.id });
+    } else {
+      this.roomsService.log(
+        'ERROR',
+        `Monitoreo fallido. No se detecto ninguna pestaña de hardware activa para: ${data.studentName}`,
+        true,
+      );
+    }
+  }
+
+  @SubscribeMessage('desktop-screenshot-response')
+  handleScreenshotResponse(
+    @ConnectedSocket() client: CustomSocket,
+    @MessageBody() data: { teacherId: string; image: any },
+  ) {
+    if (client.data.role !== 'student-web') return;
+
+    // Retransmisión directa a alta velocidad del ArrayBuffer intacto a la extensión de VS Code
+    this.server.to(data.teacherId).emit('screenshot-received', {
+      studentName: client.data.name,
+      image: data.image,
+    });
+  }
+
+  // =================================================================
+  // 📈 FLUJOS TRADICIONALES DE TELEMETRÍA Y CONTROL DE CÓDIGO
+  // =================================================================
+
+  @SubscribeMessage('request-dashboard-sync')
+  async handleDashboardSync(@ConnectedSocket() client: CustomSocket) {
+    if (client.data.role !== 'teacher') return;
+
+    const roomSockets = await this.server.in(client.data.roomId!).fetchSockets();
+
+    roomSockets.forEach((s: any) => {
+      if (s.data.role === 'student') {
+        client.emit('telemetry-updated', {
+          studentId: s.id,
+          name: s.data.name,
+          role: s.data.role,
+          isFocused: s.data.isFocused !== false,
+          wpm: s.data.wpm || 0,
+          isAskingHelp: s.data.isAskingHelp || false,
+          isCopyPaste: s.data.alertCopy || false,
+          activeFilePath: s.data.activeFilePath || '',
+        });
+      }
+
+      if (s.data.role === 'student-web') {
+        client.emit('telemetry-updated', { studentName: s.data.name, role: s.data.role, screenLinked: true });
+      }
+    });
+  }
 
   @SubscribeMessage('refresh-file-tree')
-  handleRefreshTree(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { files: string[] },
-  ) {
+  handleRefreshTree(@ConnectedSocket() client: CustomSocket, @MessageBody() data: { files: string[] }) {
     if (client.data.role !== 'student') return;
-
-    console.log(
-      `[MAPPING ÁRBOL]: [Sala ${client.data.roomId}] Alumno '${client.data.name}' indexó un total de: ${data.files?.length || 0} archivos locales.`,
-    );
-
     this.server.to(`${client.data.roomId}-teachers`).emit('student-file-tree', {
       studentId: client.id,
       name: client.data.name,
@@ -182,83 +338,30 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   @SubscribeMessage('code-update')
   handleCodeUpdate(
-    @ConnectedSocket() client: Socket,
+    @ConnectedSocket() client: CustomSocket,
     @MessageBody() data: { filePath: string; content: string },
   ) {
     if (client.data.role !== 'student') return;
-
-    this.server
-      .to(`${client.data.roomId}-teachers`)
-      .emit('code-remote-update', {
-        studentId: client.id,
-        filePath: data.filePath,
-        content: data.content,
-      });
-  }
-
-  @SubscribeMessage('student-submit-task')
-  handleStudentSubmit(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { files: any[] },
-  ) {
-    if (client.data.role !== 'student') {
-      console.warn(
-        `[⚠️ INTRUSIÓN DETECTADA]: Intento ilegítimo de snapshot final rechazado para la cuenta: ${client.data.name}`,
-      );
-      return { status: 'denied' };
-    }
-
-    console.log(
-      `[RECEPCIÓN ENTREGA]: [Sala ${client.data.roomId}] Paquete de entrega recibido de '${client.data.name}' con [${data.files?.length || 0}] recursos de desarrollo.`,
-    );
-
-    this.server
-      .to(`${client.data.roomId}-teachers`)
-      .emit('final-submission-received', {
-        studentId: client.id,
-        name: client.data.name,
-        files: data.files,
-      });
-  }
-
-  @SubscribeMessage('student-focus-change')
-  handleFocusChange(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { isFocused: boolean },
-  ) {
-    if (client.data.role !== 'student') return;
-
-    client.data.isFocused = data.isFocused;
-    client.data.lastActivity = Date.now();
-
-    console.log(
-      `[CAMBIO ENFOQUE] [Sala ${client.data.roomId}] Estudiante '${client.data.name}' -> Ventana VS Code: ${data.isFocused ? 'DENTRO (Enfoque Activo)' : '⚠️ AFUERA (Posible Distracción)'}`,
-    );
-
-    this.server.to(`${client.data.roomId}-teachers`).emit('telemetry-updated', {
+    this.server.to(`${client.data.roomId}-teachers`).emit('code-remote-update', {
       studentId: client.id,
-      name: client.data.name,
-      isFocused: data.isFocused,
-      lastActivity: client.data.lastActivity,
+      filePath: data.filePath,
+      content: data.content,
     });
   }
 
   @SubscribeMessage('student-wpm-update')
-  handleWpmUpdate(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { wpm: number; isCopyPaste: boolean },
-  ) {
+  handleWpmUpdate(@ConnectedSocket() client: CustomSocket, @MessageBody() data: { wpm: number; isCopyPaste: boolean }) {
     if (client.data.role !== 'student') return;
 
     client.data.wpm = data.wpm;
     client.data.alertCopy = data.isCopyPaste;
 
     if (data.isCopyPaste) {
-      console.warn(
-        `[🚨 ALERTA PLAGIO] [Sala ${client.data.roomId}] Ráfaga ilegal detected en '${client.data.name}' con velocidad de: ${data.wpm} WPM.`,
+      this.roomsService.log(
+        'TELEMETRÍA',
+        `¡ALERTA PLAGIO!: Escritura anomala detectada en '${client.data.name}' (${data.wpm} WPM)`,
+        true,
       );
-    } else {
-      // console.log(`[TELEMETRÍA LATIDO] [Sala ${client.data.roomId}] Rendimiento de '${client.data.name}': ${data.wpm} WPM.`,);
     }
 
     this.server.to(`${client.data.roomId}-teachers`).emit('telemetry-updated', {
@@ -270,33 +373,28 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     });
   }
 
-  @SubscribeMessage('request-help')
-  handleRequestHelp(@ConnectedSocket() client: Socket) {
+  @SubscribeMessage('student-focus-change')
+  handleFocusChange(@ConnectedSocket() client: CustomSocket, @MessageBody() data: { isFocused: boolean }) {
     if (client.data.role !== 'student') return;
 
-    client.data.isAskingHelp = true;
-    console.log(
-      `[SOLICITUD ATENCIÓN]: [Sala ${client.data.roomId}] Alumno '${client.data.name}' ha levantado la mano virtual ✋.`,
+    client.data.isFocused = data.isFocused;
+    this.roomsService.log(
+      'TELEMETRÍA',
+      `Foco de VS Code de '${client.data.name}' cambio a: ${data.isFocused ? 'DENTRO' : '⚠️ EN BACKGROUND'}`,
+      !data.isFocused,
     );
 
-    this.server
-      .to(`${client.data.roomId}-teachers`)
-      .emit('student-help-requested', {
-        studentId: client.id,
-      });
+    this.server.to(`${client.data.roomId}-teachers`).emit('telemetry-updated', {
+      studentId: client.id,
+      name: client.data.name,
+      isFocused: data.isFocused,
+    });
   }
 
   @SubscribeMessage('student-active-file-change')
-  handleActiveFileChange(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { filePath: string },
-  ) {
+  handleActiveFileChange(@ConnectedSocket() client: CustomSocket, @MessageBody() data: { filePath: string }) {
     if (client.data.role !== 'student') return;
-
     client.data.activeFilePath = data.filePath;
-    console.log(
-      `[NAVEGACIÓN INTERNA]: [Sala ${client.data.roomId}] Alumno '${client.data.name}' abrió pestaña activa: ${data.filePath}`,
-    );
 
     this.server.to(`${client.data.roomId}-teachers`).emit('telemetry-updated', {
       studentId: client.id,
@@ -304,17 +402,75 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     });
   }
 
-  /**
-   * ==========================================
-   * SECCIÓN: MENSAJERÍA COMPARTIDA (CHAT)
-   * ==========================================
-   */
+  @SubscribeMessage('request-help')
+  handleRequestHelp(@ConnectedSocket() client: CustomSocket) {
+    if (client.data.role !== 'student') return;
+
+    client.data.isAskingHelp = true;
+    this.roomsService.log('MESA_AYUDA', `Mano levantada virtualmente por el alumno: ${client.data.name}`);
+
+    this.server.to(`${client.data.roomId}-teachers`).emit('student-help-requested', { studentId: client.id });
+  }
+
+  @SubscribeMessage('resolve-help')
+  handleResolveHelp(@ConnectedSocket() client: CustomSocket, @MessageBody() data: { studentId: string }) {
+    if (client.data.role !== 'teacher') return;
+
+    const studentSocket = (this.server.sockets as any).get(data.studentId);
+    if (studentSocket) {
+      studentSocket.data.isAskingHelp = false;
+      this.roomsService.log('MESA_AYUDA', `Asistencia cerrada presencialmente para: ${studentSocket.data.name}`);
+    }
+
+    this.server.to(`${client.data.roomId}-teachers`).emit('student-help-resolved', { studentId: data.studentId });
+  }
+
+  // =================================================================
+  // ⏳ EXÁMENES, RELOJ REGRESIVO Y COLA DE ENTREGAS
+  // =================================================================
+
+  @SubscribeMessage('start-timer')
+  handleStartTimer(@ConnectedSocket() client: CustomSocket, @MessageBody() data: { roomId: string; minutes: number }) {
+    if (client.data.role !== 'teacher') return;
+
+    this.roomsService.startTimer(data.roomId, data.minutes);
+    this.roomsService.log(
+      'TIMER',
+      `⏳ Temporizador general activado para Sala: [${data.roomId}] por ${data.minutes} minutos.`,
+    );
+
+    this.server.to(data.roomId).emit('timer-started', { minutes: data.minutes, startTime: Date.now() });
+  }
+
+  @SubscribeMessage('stop-timer')
+  handleStopTimer(@ConnectedSocket() client: CustomSocket) {
+    if (client.data.role !== 'teacher') return;
+
+    this.roomsService.stopTimer(client.data.roomId!);
+    this.roomsService.log('TIMER', `⚠️ Temporizador cancelado de emergencia en Sala: [${client.data.roomId}]`, true);
+
+    this.server.to(client.data.roomId!).emit('timer-stopped');
+  }
+
+  @SubscribeMessage('student-submit-task')
+  handleStudentSubmit(@ConnectedSocket() client: CustomSocket, @MessageBody() data: { files: any[] }) {
+    if (client.data.role !== 'student') return;
+
+    this.roomsService.log('ENTREGAS', `📥 Snapshot final de evaluacion recibido del alumno: ${client.data.name}`);
+
+    this.server.to(`${client.data.roomId}-teachers`).emit('final-submission-received', {
+      studentId: client.id,
+      name: client.data.name,
+      files: data.files,
+    });
+  }
+
+  // =================================================================
+  // 💬 CHAT SALA DE CÓMPUTO Y COMUNICADOS GLOBALES
+  // =================================================================
 
   @SubscribeMessage('send-chat-message')
-  handleChatMessage(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { message: string; targetId?: string },
-  ) {
+  handleChatMessage(@ConnectedSocket() client: CustomSocket, @MessageBody() data: ChatMessagePayload) {
     const { roomId, name, role } = client.data;
     if (!roomId) return;
 
@@ -325,166 +481,52 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       message: data.message,
       targetId: data.targetId,
       isPrivate: !!data.targetId,
-      timestamp: new Date().toLocaleTimeString([], {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-      }),
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     };
 
     if (role === 'teacher') {
       if (data.targetId) {
-        console.log(
-          `[CHAT PRIVADO DOCENTE]: Profe '${name}' -> ID Destinatario: ${data.targetId} | Mensaje: ${data.message}`,
-        );
+        this.roomsService.log('CHAT', `Docente manda canal privado a Nodo [${data.targetId}]: ${data.message}`);
         this.server.to(data.targetId).emit('chat-message-received', payload);
-        client.emit('chat-message-received', payload); // Eco de retorno para renderizado propio
+        client.emit('chat-message-received', payload);
       } else {
-        console.log(
-          `[CHAT GENERAL DOCENTE]: Profe '${name}' -> TODA LA SALA [${roomId}] | Mensaje: ${data.message}`,
-        );
+        this.roomsService.log('CHAT', `Docente publica Comunicado General: ${data.message}`);
         this.server.to(roomId).emit('chat-message-received', payload);
       }
     } else {
-      console.log(
-        `[CHAT CONSULTA ALUMNO]: Estudiante '${name}' -> Canales Docentes | Mensaje: ${data.message}`,
-      );
-      this.server
-        .to(`${roomId}-teachers`)
-        .emit('chat-message-received', payload);
-      client.emit('chat-message-received', payload); // Eco de retorno para el alumno
+      this.roomsService.log('CHAT', `Alumno '${name}' escribe a mesa de consulta: ${data.message}`);
+      this.server.to(`${roomId}-teachers`).emit('chat-message-received', payload);
+      client.emit('chat-message-received', payload);
     }
   }
-
-  /**
-   * ==========================================
-   * SECCIÓN: CONTROL PEDAGÓGICO DE DOCENTES
-   * ==========================================
-   */
 
   @SubscribeMessage('teacher-create-file')
-  handleCreateFile(
-    @ConnectedSocket() client: Socket,
-    @MessageBody()
-    data: {
-      fileName: string;
-      initialContent: string;
-      isBinary: boolean;
-      studentId?: string;
-    },
-  ) {
+  handleCreateFile(@ConnectedSocket() client: CustomSocket, @MessageBody() data: any) {
     if (client.data.role !== 'teacher') return { status: 'forbidden' };
 
-    const payload = {
-      fileName: data.fileName,
-      initialContent: data.initialContent,
-      isBinary: data.isBinary,
-    };
-
+    const payload = { fileName: data.fileName, initialContent: data.initialContent, isBinary: data.isBinary };
     if (data.studentId) {
-      console.log(
-        `[DISTRIBUCIÓN PRIVADA]: Profe '${client.data.name}' inyectó archivo [${data.fileName}] -> Únicamente al Alumno ID: ${data.studentId}`,
-      );
       this.server.to(data.studentId).emit('create-local-file', payload);
     } else {
-      console.log(
-        `[DISTRIBUCIÓN MASIVA]: Profe '${client.data.name}' inyectó recurso guía [${data.fileName}] -> A toda la clase de la Sala [${client.data.roomId}]`,
-      );
-      client.to(client.data.roomId).emit('create-local-file', payload);
+      client.to(client.data.roomId!).emit('create-local-file', payload);
     }
-  }
-
-  @SubscribeMessage('start-timer')
-  handleStartTimer(client: Socket, data: { roomId: string; minutes: number }) {
-    if (client.data.role !== 'teacher') return;
-
-    const endTime = Date.now() + data.minutes * 60000;
-
-    this.activeTimers.set(data.roomId, {
-      duration: data.minutes,
-      endTime: endTime,
-    });
-
-    console.log(
-      `[CONTROL CRONÓMETRO]: ⏳ Profe '${client.data.name}' inició Desafío Técnico de [${data.minutes}] minutos en la Sala [${data.roomId}]`,
-    );
-
-    this.server.to(data.roomId).emit('timer-started', {
-      minutes: data.minutes,
-      startTime: Date.now(),
-    });
-  }
-
-  @SubscribeMessage('stop-timer')
-  handleStopTimer(client: Socket) {
-    if (client.data.role !== 'teacher') return;
-
-    console.log(
-      `[CANCELACIÓN CRONÓMETRO]: ⚠️ Profe '${client.data.name}' detuvo de forma manual el conteo en la Sala [${client.data.roomId}]`,
-    );
-
-    this.activeTimers.delete(client.data.roomId);
-    this.server.to(client.data.roomId).emit('timer-stopped');
   }
 
   @SubscribeMessage('request-file-content')
   handleRequestFile(
-    @ConnectedSocket() client: Socket,
+    @ConnectedSocket() client: CustomSocket,
     @MessageBody() data: { studentId: string; filePath: string },
   ) {
     if (client.data.role !== 'teacher') return;
-
-    console.log(
-      `[INSPECCIÓN P2P SOLICITADA]: Profe '${client.data.name}' ordenó lectura del buffer físico de: ${data.filePath} en ID Alumno: ${data.studentId}`,
-    );
-
-    this.server
-      .to(data.studentId)
-      .emit('get-content', { teacherId: client.id, filePath: data.filePath });
+    this.server.to(data.studentId).emit('get-content', { teacherId: client.id, filePath: data.filePath });
   }
 
   @SubscribeMessage('send-content')
-  handleSendContent(
-    @ConnectedSocket() client: Socket,
-    @MessageBody()
-    data: { teacherId: string; filePath: string; content: string },
-  ) {
-    console.log(
-      `[INSPECCIÓN P2P RESPUESTA]: Transferencia de buffer completada desde Alumno '${client.data.name}' hacia Canal Docente.`,
-    );
-
+  handleSendContent(@ConnectedSocket() client: CustomSocket, @MessageBody() data: any) {
     this.server.to(data.teacherId).emit('file-content-received', {
       studentId: client.id,
       filePath: data.filePath,
       content: data.content,
     });
-  }
-
-  @SubscribeMessage('resolve-help')
-  handleResolveHelp(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { studentId: string },
-  ) {
-    if (client.data.role !== 'teacher') return;
-
-    // Buscar el socket específico del alumno para apagar su bandera de solicitud en la cache interna
-    const studentSocket = (this.server.sockets as any).get(data.studentId);
-    if (studentSocket) {
-      studentSocket.data.isAskingHelp = false;
-      console.log(
-        `[ASISTENCIA CONCLUIDA]: Profe '${client.data.name}' marcó caso resuelto para: ${studentSocket.data.name || data.studentId}`,
-      );
-    } else {
-      console.log(
-        `[ASISTENCIA CONCLUIDA]: Caso resuelto para ID: ${data.studentId} (Usuario no mapeado o desconectado)`,
-      );
-    }
-
-    // Notificar a todos los paneles docentes del aula para limpiar el indicador de alerta visual
-    this.server
-      .to(`${client.data.roomId}-teachers`)
-      .emit('student-help-resolved', {
-        studentId: data.studentId,
-      });
   }
 }
