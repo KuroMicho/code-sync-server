@@ -10,11 +10,13 @@ import {
 import { Server } from 'socket.io';
 import { RoomsService } from './rooms.service';
 import type { CustomSocket, JoinRoomPayload, ChatMessagePayload } from './rooms.types';
+import { ChallengesService } from '../challenges/challenges.service';
+import { ChallengeEvaluatorService } from '../challenges/challenge-evaluator.service';
 
 @WebSocketGateway({
   cors: { origin: '*' },
   namespace: 'code-sync',
-  maxHttpBufferSize: 3e7, // 30MB para transferir snapshots y buffers binarios masivos sin desbordamientos
+  maxHttpBufferSize: 3e7,
   pingInterval: 10000,
   pingTimeout: 20000,
 })
@@ -22,7 +24,11 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server!: Server;
 
-  constructor(private readonly roomsService: RoomsService) {}
+  constructor(
+    private readonly roomsService: RoomsService,
+    private readonly challengesService: ChallengesService,
+    private readonly evaluatorService: ChallengeEvaluatorService,
+  ) {}
 
   /**
    * Registra el enlace de hardware inicial de un cliente en los logs del clúster.
@@ -50,7 +56,6 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         role: role,
       });
 
-      // 🛡️ PURGA AUTOMÁTICA CRUZADA: Si el estudiante cierra su VS Code, clausura su webapp asociada
       if (role === 'student' && name) {
         this.server
           .in(roomId)
@@ -78,10 +83,6 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
    */
   @SubscribeMessage('join-room')
   async handleJoinRoom(@ConnectedSocket() client: CustomSocket, @MessageBody() data: JoinRoomPayload) {
-    // -----------------------------------------------------------------
-    // 🛡️ SUB-ESTACIÓN 1: VALIDACIONES FILTRADAS DE SEGURIDAD
-    // -----------------------------------------------------------------
-
     if (data.role === 'teacher') {
       const masterKey = process.env.CODESYNC_TEACHER_KEY;
       if (!data.accessKey || data.accessKey !== masterKey) {
@@ -101,7 +102,6 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       const roomSockets = await this.server.in(data.roomId).fetchSockets();
       const webNameClean = data.name.trim().toLowerCase();
 
-      // Buscamos la sesion origen de VS Code del alumno
       const vscodeSocketTarget = roomSockets.find(
         (s: any) => s.data.role === 'student' && s.data.name.trim().toLowerCase() === webNameClean,
       );
@@ -119,14 +119,9 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         return;
       }
 
-      // 🚀 ANTÍDOTO AL CLON DE CARDS: Forzamos a que adopte exactamente la tipografia registrada en el editor
       data.name = vscodeSocketTarget.data.name;
     }
 
-    // -----------------------------------------------------------------
-    // ⚙️ SUB-ESTACIÓN 2: LIMPIEZA Y PERSISTENCIA COMÚN DE IDENTIDAD
-    // -----------------------------------------------------------------
-    // Purgamos sesiones huérfanas o duplicadas previas del mismo alumno en VS Code
     if (data.role === 'student') {
       const activeSockets = await this.server.in(data.roomId).fetchSockets();
       const nuevoNombreClean = data.name.trim().toLowerCase();
@@ -176,11 +171,9 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       `Cuenta '${data.name}' autorizada para rol [${data.role.toUpperCase()}] en Sala: ${data.roomId}`,
     );
 
-    // Limpieza de buffers de salas previos en caliente para mitigar fugas de trafico
     const currentRooms = Array.from(client.rooms).filter((r) => r !== client.id);
     currentRooms.forEach((r) => client.leave(r));
 
-    // Mapeo de identidad en metadatos volatiles de socket
     client.data.role = data.role;
     client.data.name = data.name;
     client.data.roomId = data.roomId;
@@ -191,16 +184,14 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       client.data.isAskingHelp = false;
       client.data.alertCopy = false;
       client.data.activeFilePath = '';
+      client.data.ultimoCodigoPicado = '';
     }
 
     client.join(data.roomId);
 
-    // -----------------------------------------------------------------
-    // 🗺️ SUB-ESTACIÓN 3: ENRUTAMIENTO DE LOGICA REACTIVA POR ROL
-    // -----------------------------------------------------------------
     switch (data.role) {
       case 'student-web': {
-        this.roomsService.log('VINCULACIÓN_WEB', `Canal multimedia web activado para: ${data.name}`);
+        this.roomsService.log('VINCULACIÓN_WEB', `Canal multimedia web activated para: ${data.name}`);
         client.emit('join-success');
         this.server.to(`${data.roomId}-teachers`).emit('telemetry-updated', {
           studentName: data.name,
@@ -214,7 +205,6 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         client.to(data.roomId).emit('request-sync');
         client.emit('join-success', { role: 'teacher', name: data.name, roomId: data.roomId });
 
-        // Reconstrucción Late-Join asincrona para el Docente que entra tarde
         const roomSockets = await this.server.in(data.roomId).fetchSockets();
         roomSockets.forEach((s: any) => {
           if (s.data.role === 'student') {
@@ -239,13 +229,11 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       case 'student': {
         client.emit('join-success', { role: 'student', name: data.name, roomId: data.roomId });
 
-        // Sincronización proactiva de cronometros contra cortes de red
         const remainingMs = this.roomsService.getRemainingMs(data.roomId);
         if (remainingMs > 0) {
           client.emit('timer-started', { minutes: remainingMs / 60000, isSync: true });
         }
 
-        // Despacho directo a la sala comun para que el Docente intercepte al alumno al instante
         this.server.to(data.roomId).emit('user-joined', {
           id: client.id,
           name: data.name,
@@ -257,10 +245,6 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     return { status: 'ok', session: client.data };
   }
-
-  // =================================================================
-  // 📸 PIPELINE DE CAPTURAS DE MONITOR EN VIVO (MÓDULO BINARIO RAW)
-  // =================================================================
 
   @SubscribeMessage('request-desktop-screenshot')
   async handleRequestScreenshot(@ConnectedSocket() client: CustomSocket, @MessageBody() data: { studentName: string }) {
@@ -289,16 +273,11 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   ) {
     if (client.data.role !== 'student-web') return;
 
-    // Retransmisión directa a alta velocidad del ArrayBuffer intacto a la extensión de VS Code
     this.server.to(data.teacherId).emit('screenshot-received', {
       studentName: client.data.name,
       image: data.image,
     });
   }
-
-  // =================================================================
-  // 📈 FLUJOS TRADICIONALES DE TELEMETRÍA Y CONTROL DE CÓDIGO
-  // =================================================================
 
   @SubscribeMessage('request-dashboard-sync')
   async handleDashboardSync(@ConnectedSocket() client: CustomSocket) {
@@ -342,6 +321,9 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: { filePath: string; content: string },
   ) {
     if (client.data.role !== 'student') return;
+
+    client.data.ultimoCodigoPicado = data.content;
+
     this.server.to(`${client.data.roomId}-teachers`).emit('code-remote-update', {
       studentId: client.id,
       filePath: data.filePath,
@@ -425,10 +407,6 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.server.to(`${client.data.roomId}-teachers`).emit('student-help-resolved', { studentId: data.studentId });
   }
 
-  // =================================================================
-  // ⏳ EXÁMENES, RELOJ REGRESIVO Y COLA DE ENTREGAS
-  // =================================================================
-
   @SubscribeMessage('start-timer')
   handleStartTimer(@ConnectedSocket() client: CustomSocket, @MessageBody() data: { roomId: string; minutes: number }) {
     if (client.data.role !== 'teacher') return;
@@ -464,10 +442,6 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       files: data.files,
     });
   }
-
-  // =================================================================
-  // 💬 CHAT SALA DE CÓMPUTO Y COMUNICADOS GLOBALES
-  // =================================================================
 
   @SubscribeMessage('send-chat-message')
   handleChatMessage(@ConnectedSocket() client: CustomSocket, @MessageBody() data: ChatMessagePayload) {
@@ -523,10 +497,113 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   @SubscribeMessage('send-content')
   handleSendContent(@ConnectedSocket() client: CustomSocket, @MessageBody() data: any) {
+    if (client.data.role !== 'student') return;
+
     this.server.to(data.teacherId).emit('file-content-received', {
       studentId: client.id,
       filePath: data.filePath,
       content: data.content,
+    });
+  }
+
+  /**
+   * Evento: La webapp del estudiante solicita la lista de ejercicios de la sala.
+   */
+  @SubscribeMessage('request-challenges')
+  handleRequestChallenges(@ConnectedSocket() client: CustomSocket) {
+    const { roomId, role } = client.data;
+    if (!roomId || role !== 'student-web') return { status: 'error', message: 'Acceso denegado o sala inválida.' };
+
+    const listado = this.challengesService.getChallengesForRoom(roomId);
+    client.emit('challenges-list', listado);
+    return { status: 'ok' };
+  }
+
+  /**
+   * Evento: El estudiante presiona "Empezar" en la web.
+   * El servidor localiza su VS Code gemelo e inyecta los archivos plantilla en caliente.
+   */
+  @SubscribeMessage('student-start-challenge')
+  async handleStartChallenge(@ConnectedSocket() client: CustomSocket, @MessageBody() data: { challengeId: string }) {
+    const { roomId, name, role } = client.data;
+    if (!roomId || !name || role !== 'student-web') return { status: 'forbidden' };
+
+    try {
+      const challenge = this.challengesService.getChallengeById(data.challengeId);
+      const roomSockets = await this.server.in(roomId).fetchSockets();
+
+      const vscodeSocketTarget = roomSockets.find(
+        (s: any) => s.data.role === 'student' && s.data.name.trim().toLowerCase() === name.trim().toLowerCase(),
+      );
+
+      if (!vscodeSocketTarget) {
+        return { status: 'error', message: 'No se detectó la extensión de VS Code en línea.' };
+      }
+
+      client.data.activeChallengeId = data.challengeId;
+
+      challenge.templateFiles.forEach((file) => {
+        this.server.to(vscodeSocketTarget.id).emit('create-local-file', {
+          fileName: file.path,
+          initialContent: Buffer.from(file.content).toString('base64'),
+        });
+      });
+
+      this.roomsService.log(
+        'DESAFÍO_INICIADO',
+        `Inyectando plantilla del ejercicio '${challenge.id}' al VS Code de ${name}.`,
+      );
+      return { status: 'ok' };
+    } catch (error) {
+      return { status: 'error', message: 'Fallo al procesar la inyección del ejercicio.' };
+    }
+  }
+
+  /**
+   * Evento: El estudiante presiona "Validar Código" en la interfaz web.
+   * Lee la caché de código directamente de la RAM del servidor para evitar colisiones de red.
+   */
+  @SubscribeMessage('verify-challenge-code')
+  async handleVerifyChallenge(@ConnectedSocket() client: CustomSocket, @MessageBody() data: { challengeId: string }) {
+    const { roomId, name, role } = client.data;
+    if (!roomId || !name || role !== 'student-web') return { status: 'forbidden' };
+
+    const roomSockets = await this.server.in(roomId).fetchSockets();
+
+    const vscodeSocket = roomSockets.find(
+      (s: any) => s.data.role === 'student' && s.data.name.trim().toLowerCase() === name.trim().toLowerCase(),
+    );
+
+    if (!vscodeSocket) {
+      client.emit('verify-result', { exitoso: false, reporte: 'Error: No se detectó tu editor VS Code en línea.' });
+      return;
+    }
+
+    const codigoAlumno = vscodeSocket.data.ultimoCodigoPicado || '';
+
+    if (!codigoAlumno.trim()) {
+      client.emit('verify-result', {
+        exitoso: false,
+        reporte:
+          'Consola: No se ha detectado actividad de escritura en el archivo aún. Digita un carácter en tu editor primero.',
+      });
+      return;
+    }
+
+    this.roomsService.log('PRE_EVALUACIÓN', `Evaluando caché en RAM de forma asíncrona para: ${name}`);
+
+    const targetWebId = client.id;
+
+    process.nextTick(async () => {
+      try {
+        const resultadoTests = await this.evaluatorService.evaluarCodigo(data.challengeId, name, codigoAlumno);
+        this.server.to(targetWebId).emit('verify-result', resultadoTests);
+      } catch (err) {
+        this.server.to(targetWebId).emit('verify-result', {
+          exitoso: false,
+          reporte: 'Error interno: El Test Runner nativo colapsó al compilar.',
+        });
+      }
     });
   }
 }

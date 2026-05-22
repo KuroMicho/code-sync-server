@@ -1,8 +1,10 @@
 import { Module } from '@nestjs/common';
-import { RoomsGateway } from './rooms/rooms.gateway';
-import { RoomsService } from './rooms/rooms.service';
+import { RoomsGateway } from './rooms.gateway';
+import { RoomsService } from './rooms.service';
+import { ChallengesModule } from 'src/challenges/challenges.module';
 
 @Module({
+  imports: [ChallengesModule],
   providers: [RoomsService, RoomsGateway],
   exports: [RoomsService],
 })
