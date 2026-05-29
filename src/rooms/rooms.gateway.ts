@@ -31,7 +31,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   ) {}
 
   /**
-   * Registra el enlace de hardware inicial de un cliente en los logs del clúster.
+   * Registra el enlace de hardware inicial de un cliente.
    */
   handleConnection(@ConnectedSocket() client: CustomSocket) {
     this.roomsService.log('CONEXIÓN', `Canal de red establecido con éxito para el ID: ${client.id}`);
@@ -39,7 +39,6 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   /**
    * Gestiona el ciclo de vida de desconexión.
-   * Si es un nodo web o de edición, notifica inmediatamente a las mesas de control docentes.
    */
   handleDisconnect(@ConnectedSocket() client: CustomSocket) {
     const { name, roomId, role } = client.data;
@@ -202,6 +201,9 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
       case 'teacher': {
         client.join(`${data.roomId}-teachers`);
+
+        client.emit('request-teacher-state-recovery', { roomId: data.roomId });
+
         client.to(data.roomId).emit('request-sync');
         client.emit('join-success', { role: 'teacher', name: data.name, roomId: data.roomId });
 
@@ -234,16 +236,48 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
           client.emit('timer-started', { minutes: remainingMs / 60000, isSync: true });
         }
 
-        this.server.to(data.roomId).emit('user-joined', {
+        this.server.to(`${data.roomId}-teachers`).emit('user-joined', {
           id: client.id,
           name: data.name,
           role: data.role,
         });
+
+        this.server
+          .to(`${data.roomId}-teachers`)
+          .emit('request-student-refresh', { studentId: client.id, name: data.name });
         break;
       }
     }
 
     return { status: 'ok', session: client.data };
+  }
+
+  /**
+   * EVENTO MAESTRO: La extensión del docente responde al servidor inyectando la estampa
+   * de tiempo exacta en que debe terminar la clase para re-armar el cronómetro tras una caída.
+   */
+  @SubscribeMessage('recover-timer-state')
+  handleRecoverTimerState(
+    @ConnectedSocket() client: CustomSocket,
+    @MessageBody() data: { roomId: string; targetEndTimestamp: number },
+  ) {
+    if (client.data.role !== 'teacher') return;
+
+    const now = Date.now();
+    const remainingMs = data.targetEndTimestamp - now;
+
+    if (remainingMs > 0) {
+      const minutesRemaining = remainingMs / 60000;
+
+      this.roomsService.startTimer(data.roomId, minutesRemaining);
+
+      this.roomsService.log(
+        'RECOVERY_TIMER',
+        `Sincronización Maestra: Sala [${data.roomId}] restaurada. Quedan ${minutesRemaining.toFixed(2)} minutos.`,
+      );
+
+      this.server.to(data.roomId).emit('timer-started', { minutes: minutesRemaining, isSync: true });
+    }
   }
 
   @SubscribeMessage('request-desktop-screenshot')
@@ -332,18 +366,37 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('student-wpm-update')
-  handleWpmUpdate(@ConnectedSocket() client: CustomSocket, @MessageBody() data: { wpm: number; isCopyPaste: boolean }) {
+  handleWpmUpdate(
+    @ConnectedSocket() client: CustomSocket,
+    @MessageBody() data: { wpm: number; isCopyPaste: boolean; filePath?: string },
+  ) {
     if (client.data.role !== 'student') return;
 
     client.data.wpm = data.wpm;
     client.data.alertCopy = data.isCopyPaste;
 
     if (data.isCopyPaste) {
+      const archivoAfectado = data.filePath || 'Archivo no especificado';
+
       this.roomsService.log(
         'TELEMETRÍA',
         `¡ALERTA PLAGIO!: Escritura anomala detectada en '${client.data.name}' (${data.wpm} WPM)`,
         true,
       );
+
+      if (!client.data.plagiarismHistory) {
+        client.data.plagiarismHistory = [];
+      }
+
+      const yaRegistrado = client.data.plagiarismHistory.some((h: any) => h.file === archivoAfectado);
+
+      if (!yaRegistrado) {
+        client.data.plagiarismHistory.push({
+          file: archivoAfectado,
+          timestamp: new Date().toLocaleString('es-CO', { timeZone: 'America/Bogota' }),
+          wpm: data.wpm,
+        });
+      }
     }
 
     this.server.to(`${client.data.roomId}-teachers`).emit('telemetry-updated', {
@@ -417,6 +470,9 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       `⏳ Temporizador general activado para Sala: [${data.roomId}] por ${data.minutes} minutos.`,
     );
 
+    const targetEndTimestamp = Date.now() + data.minutes * 60000;
+    client.emit('timer-registered-on-teacher', { targetEndTimestamp });
+
     this.server.to(data.roomId).emit('timer-started', { minutes: data.minutes, startTime: Date.now() });
   }
 
@@ -440,6 +496,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       studentId: client.id,
       name: client.data.name,
       files: data.files,
+      plagiarismHistory: client.data.plagiarismHistory || [],
     });
   }
 
@@ -506,9 +563,6 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     });
   }
 
-  /**
-   * Evento: La webapp del estudiante solicita la lista de ejercicios de la sala.
-   */
   @SubscribeMessage('request-challenges')
   handleRequestChallenges(@ConnectedSocket() client: CustomSocket) {
     const { roomId, role } = client.data;
@@ -519,10 +573,6 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     return { status: 'ok' };
   }
 
-  /**
-   * Evento: El estudiante presiona "Empezar" en la web.
-   * El servidor localiza su VS Code gemelo e inyecta los archivos plantilla en caliente.
-   */
   @SubscribeMessage('student-start-challenge')
   async handleStartChallenge(@ConnectedSocket() client: CustomSocket, @MessageBody() data: { challengeId: string }) {
     const { roomId, name, role } = client.data;
@@ -559,10 +609,6 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }
   }
 
-  /**
-   * Evento: El estudiante presiona "Validar Código" en la interfaz web.
-   * Lee la caché de código directamente de la RAM del servidor para evitar colisiones de red.
-   */
   @SubscribeMessage('verify-challenge-code')
   async handleVerifyChallenge(@ConnectedSocket() client: CustomSocket, @MessageBody() data: { challengeId: string }) {
     const { roomId, name, role } = client.data;

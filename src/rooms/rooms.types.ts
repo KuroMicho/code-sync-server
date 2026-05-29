@@ -48,5 +48,6 @@ export interface CustomSocket extends Socket {
     lastActivity?: number;
     activeChallengeId?: string;
     ultimoCodigoPicado?: string;
+    plagiarismHistory?: any[];
   };
 }

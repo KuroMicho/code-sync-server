@@ -51,6 +51,7 @@ export class RoomsService {
       | 'MESA_AYUDA'
       | 'TELEMETRÍA'
       | 'TIMER'
+      | 'RECOVERY_TIMER'
       | 'ALERTA_SEGURIDAD'
       | 'ERROR'
       | 'DESAFÍO_INICIADO'

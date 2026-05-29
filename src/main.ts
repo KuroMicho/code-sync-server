@@ -5,7 +5,7 @@ import { AppModule } from './app.module';
 async function bootstrap() {
   const app = await NestFactory.create<NestFastifyApplication>(AppModule, new FastifyAdapter());
 
-  const allowedOrigins = ['http://localhost:3000', 'http://localhost:5173'];
+  const allowedOrigins = ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:5500'];
 
   if (process.env.CORS_ORIGIN) {
     allowedOrigins.push(process.env.CORS_ORIGIN);
