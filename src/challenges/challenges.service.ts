@@ -3,31 +3,69 @@ import { Challenge } from './challenges.types';
 
 @Injectable()
 export class ChallengesService {
-  // 🏛️ NUESTRO BANCO DE EJERCICIOS EN MEMORIA (PROVISIONAL)
   private readonly mockChallenges: Challenge[] = [
     {
       id: 'ex-01',
-      title: '1. Filtro de Números Pares',
+      title: '🐸 1. Misión: Salto del Laberinto (Lógica)',
       description:
-        'Escribe una función llamada <code>filtrarPares(arr)</code> que reciba un array de números y devuelva un nuevo array únicamente con los números que sean pares. El archivo ya incluye la estructura base.',
+        '¡Nuestra rana necesita escapar! Crea la función <code>calcularSaltos(distancia, potencia)</code>. Debe retornar cuántos saltos exactos le tomará salir del laberinto si cada salto avanza la potencia indicada. Si la potencia es cero o negativa, la rana no se mueve y debe retornar <code>0</code>.',
       difficulty: 'easy',
       templateFiles: [
         {
-          path: 'ejercicio-1.js',
-          content: `// CodeSync - Desafío 1: Filtro de Números Pares\n\nfunction filtrarPares(arr) {\n  // Tu código aquí\n  return [];\n}\n\n// Ejemplos de prueba:\n// console.log(filtrarPares([1, 2, 3, 4, 5, 6])); // Debería retornar [2, 4, 6]\n`,
+          path: 'desafio-1.js',
+          content: `// 🐸 Misión Froggy: Salto del Laberinto\n// Retorna el número de saltos necesarios para salir (distancia / potencia)\n\nfunction calcularSaltos(distancia, potencia) {\n  if (potencia <= 0) return 0;\n  return Math.ceil(distancia / potencia);\n}\n\n// Consola de pruebas:\n// console.log(calcularSaltos(10, 3)); // Debería retornar 4 saltos\n`,
         },
       ],
     },
     {
       id: 'ex-02',
-      title: '2. Contador de Caracteres',
+      title: '🎒 2. El Inventario del Explorador (Fundamentos)',
       description:
-        'Crea una función llamada <code>contarLetras(texto, letra)</code> que cuente cuántas veces aparece una letra específica dentro de una cadena de texto. Recuerda evaluar mayúsculas y minúsculas.',
-      difficulty: 'medium',
+        'Tu personaje tiene un array con ítems de supervivencia. Crea la función <code>filtrarPeligro(inventario)</code> que reciba un array de strings y devuelva un nuevo array **excluyendo** el ítem exacto <code>"bomba"</code> para que el explorador viaje seguro.',
+      difficulty: 'easy',
       templateFiles: [
         {
-          path: 'ejercicio-2.js',
-          content: `// CodeSync - Desafío 2: Contador de Caracteres\n\nfunction contarLetras(texto, letra) {\n  // Tu código aquí\n  return 0;\n}\n\n// Ejemplos de prueba:\n// console.log(contarLetras("Programando en CodeSync", "o")); // Debería retornar 3\n`,
+          path: 'desafio-2.js',
+          content: `// 🎒 Misión Explorador: Limpiar Inventario de Riesgos\n// Devuelve el array filtrado sin el string "bomba"\n\nfunction filtrarPeligro(inventario) {\n  return inventario.filter(item => item !== "bomba");\n}\n\n// Consola de pruebas:\n// console.log(filtrarPeligro(["cuerda", "bomba", "antorcha"])); // Retorna ["cuerda", "antorcha"]\n`,
+        },
+      ],
+    },
+    {
+      id: 'ex-03',
+      title: '🚨 3. Hackeo al Sistema de Alarma (DOM)',
+      description:
+        '¡Un intruso cortó la luz! Escribe la función <code>activarModoInvasión()</code> que busque el contenedor con ID <code>"alarma"</code> en el árbol del DOM, le agregue la clase CSS <code>"peligro-rojo"</code> y cambie su texto interno a <code>"SISTEMA COMPROMETIDO"</code>.',
+      difficulty: 'easy',
+      templateFiles: [
+        {
+          path: 'desafio-3.js',
+          content: `// 🚨 Misión Ciberseguridad: Modificar Entorno DOM\n// Encuentra la alarma, inyecta la clase y muta el texto\n\nfunction activarModoInvasión() {\n  const alarmaNode = document.getElementById("alarma");\n  alarmaNode.classList.add("peligro-rojo");\n  alarmaNode.innerText = "SISTEMA COMPROMETIDO";\n}\n`,
+        },
+      ],
+    },
+    {
+      id: 'ex-04',
+      title: '⚔️ 4. Forja del Héroe Guerrero (POO)',
+      description:
+        'Instancia un sistema de combate básico. Define una clase llamada <code>Guerrero</code> cuyo constructor reciba un <code>nombre</code> y sus puntos de <code>vida</code>. Debe tener un método llamado <code>recibirDaño(puntos)</code> que reste esa cantidad de sus puntos de vida actuales.',
+      difficulty: 'easy',
+      templateFiles: [
+        {
+          path: 'desafio-4.js',
+          content: `// ⚔️ Misión POO: Constructor e Instancia de Combate\n// Define la clase Guerrero y su método de reducción de vida\n\nclass Guerrero {\n  constructor(nombre, vida) {\n    this.nombre = nombre;\n    this.vida = vida;\n  }\n  recibirDaño(puntos) {\n    this.vida -= puntos;\n  }\n}\n\n// Consola de pruebas:\n// const heroe = new Guerrero("Thor", 100);\n// heroe.recibirDaño(30);\n// console.log(heroe.vida); // Debería retornar 70\n`,
+        },
+      ],
+    },
+    {
+      id: 'ex-05',
+      title: '🔥 5. Hechicero del Clima (DOM & Lógica)',
+      description:
+        'Crea la función <code>invocarClima(tipo)</code>. Si el tipo es <code>"fuego"</code>, debe cambiar el color de fondo (<code>style.backgroundColor</code>) del body a <code>"crimson"</code>. Si el tipo es <code>"hielo"</code>, debe cambiarlo a <code>"cyan"</code>. Cualquier otro tipo debe dejarlo en <code>"black"</code>.',
+      difficulty: 'easy',
+      templateFiles: [
+        {
+          path: 'desafio-5.js',
+          content: `// 🔥 Misión Hechicero: Mutación Cromática Dinámica\n// Cambia el background del body según el string del parámetro\n\nfunction invocarClima(tipo) {\n  const body = document.body;\n  if (tipo === "fuego") body.style.backgroundColor = "crimson";\n  else if (tipo === "hielo") body.style.backgroundColor = "cyan";\n  else body.style.backgroundColor = "black";\n}\n`,
         },
       ],
     },
@@ -35,10 +73,8 @@ export class ChallengesService {
 
   /**
    * Obtiene todos los desafíos disponibles para una sala.
-   * Por ahora, todas las salas comparten el mismo banco de pruebas.
    */
   getChallengesForRoom(roomId: string): Challenge[] {
-    // Aquí en el futuro harías un query a Firebase/Postgres: WHERE room_id = roomId
     return this.mockChallenges;
   }
 

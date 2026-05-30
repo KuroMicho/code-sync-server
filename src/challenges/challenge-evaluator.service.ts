@@ -66,16 +66,17 @@ export class ChallengeEvaluatorService {
         const test = require('node:test');
         const assert = require('node:assert');
 
-        test('Caso 1: Array con pares e impares comunes', () => {
-          assert.deepStrictEqual(filtrarPares([1, 2, 3, 4, 5, 6]), [2, 4, 6]);
+        test('Caso 1: División exacta común', () => {
+          assert.strictEqual(calcularSaltos(9, 3), 3);
         });
 
-        test('Caso 2: Array compuesto únicamente por números impares', () => {
-          assert.deepStrictEqual(filtrarPares([1, 3, 5, 7]), []);
+        test('Caso 2: División con residuo decimal (Redondeo hacia arriba)', () => {
+          assert.strictEqual(calcularSaltos(10, 3), 4);
         });
 
-        test('Caso 3: Array con números negativos y el número cero', () => {
-          assert.deepStrictEqual(filtrarPares([-2, -1, 0, 1, 2]), [-2, 0, 2]);
+        test('Caso 3: Control de potencia inválida menor o igual a cero', () => {
+          assert.strictEqual(calcularSaltos(15, 0), 0);
+          assert.strictEqual(calcularSaltos(10, -2), 0);
         });
       `;
     }
@@ -85,16 +86,92 @@ export class ChallengeEvaluatorService {
         const test = require('node:test');
         const assert = require('node:assert');
 
-        test('Caso 1: Conteo de letras minúsculas comunes', () => {
-          assert.strictEqual(contarLetras("programacion", "o"), 2);
+        test('Caso 1: Inventario con una bomba en el medio', () => {
+          assert.deepStrictEqual(filtrarPeligro(["cuerda", "bomba", "antorcha"]), ["cuerda", "antorcha"]);
         });
 
-        test('Caso 2: Evaluación case-insensitive (Mayúsculas)', () => {
-          assert.strictEqual(contarLetras("CodeSync Online", "o"), 2);
+        test('Caso 2: Inventario limpio sin riesgos', () => {
+          assert.deepStrictEqual(filtrarPeligro(["mapa", "brújula"]), ["mapa", "brújula"]);
         });
 
-        test('Caso 3: Cadena de texto vacía sin coincidencias', () => {
-          assert.strictEqual(contarLetras("", "a"), 0);
+        test('Caso 3: Inventario vacío o compuesto solo por bombas', () => {
+          assert.deepStrictEqual(filtrarPeligro(["bomba", "bomba"]), []);
+          assert.deepStrictEqual(filtrarPeligro([]), []);
+        });
+      `;
+    }
+
+    if (challengeId === 'ex-03') {
+      return `
+        const test = require('node:test');
+        const assert = require('node:assert');
+
+        // 🔥 SIMULADOR DE DOM EN ENTORNO DE CONSOLA NODE
+        const mockAlarmaElement = {
+          classList: {
+            classes: new Set(),
+            add(className) { this.classes.add(className); }
+          },
+          innerText: ""
+        };
+
+        global.document = {
+          getElementById: (id) => id === "alarma" ? mockAlarmaElement : null
+        };
+
+        test('Caso 1: Ejecución e Inyección de Clases y Textos en el Nodo Alarma', () => {
+          activarModoInvasión();
+          assert.strictEqual(mockAlarmaElement.innerText, "SISTEMA COMPROMETIDO");
+          assert.ok(mockAlarmaElement.classList.classes.has("peligro-rojo"));
+        });
+      `;
+    }
+
+    if (challengeId === 'ex-04') {
+      return `
+        const test = require('node:test');
+        const assert = require('node:assert');
+
+        test('Caso 1: Constructor de Clase e inicialización correcta', () => {
+          const heroe = new Guerrero("Thor", 100);
+          assert.strictEqual(heroe.nombre, "Thor");
+          assert.strictEqual(heroe.vida, 100);
+        });
+
+        test('Caso 2: Evaluación del método recibirDaño', () => {
+          const heroe = new Guerrero("Arthur", 80);
+          heroe.recibirDaño(25);
+          assert.strictEqual(heroe.vida, 55);
+          heroe.recibirDaño(60);
+          assert.strictEqual(heroe.vida, -5);
+        });
+      `;
+    }
+
+    if (challengeId === 'ex-05') {
+      return `
+        const test = require('node:test');
+        const assert = require('node:assert');
+
+        // 🔥 SIMULADOR DE CONTEXTO BODY PARA EL ENTORNO LOCAL
+        const mockBody = {
+          style: { backgroundColor: "" }
+        };
+        global.document = { body: mockBody };
+
+        test('Caso 1: Conjurando clima de Fuego', () => {
+          invocarClima("fuego");
+          assert.strictEqual(mockBody.style.backgroundColor, "crimson");
+        });
+
+        test('Caso 2: Conjurando clima de Hielo', () => {
+          invocarClima("hielo");
+          assert.strictEqual(mockBody.style.backgroundColor, "cyan");
+        });
+
+        test('Caso 3: Conjurando condiciones por defecto', () => {
+          invocarClima("tormenta");
+          assert.strictEqual(mockBody.style.backgroundColor, "black");
         });
       `;
     }
